@@ -1,13 +1,15 @@
 use std::{
-    error, fmt,
-    io::{BufRead, BufReader, BufWriter, Write},
+    error,
+    io::{self, BufReader, BufWriter, Read, Write},
     net::{TcpListener, TcpStream},
     str::from_utf8,
     thread::sleep,
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime}, mem::transmute,
 };
 
 use crate::storage::Storage;
+
+const OK: [u8; 3] = [79, 75, 0];
 
 pub struct DbServer<'a> {
     listener: TcpListener,
@@ -49,17 +51,6 @@ struct StreamHandler<'a> {
     writer: BufWriter<&'a TcpStream>,
     reader: BufReader<&'a TcpStream>,
 }
-
-#[derive(Debug, Clone)]
-struct InvalidMsgError;
-
-impl fmt::Display for InvalidMsgError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "msg invalid")
-    }
-}
-
-impl error::Error for InvalidMsgError {}
 
 impl StreamHandler<'_> {
     fn handle(stream: TcpStream, storage: &mut dyn Storage) -> Result<(), Box<dyn error::Error>> {
@@ -112,45 +103,61 @@ impl StreamHandler<'_> {
         let timeout_ms = 2000;
         let start = SystemTime::now();
 
-        let mut command = String::new();
-        let mut size;
+        let mut command_buf: [u8; 3] = [0; 3];
         loop {
-            size = self.reader.read_line(&mut command)?;
-            if size != 0 {
-                break;
-            }
+            match self.reader.read_exact(&mut command_buf) {
+                Ok(_) => break,
+                Err(error) => match error.kind() {
+                    io::ErrorKind::UnexpectedEof => {}
+                    _ => {
+                        return Err(Box::new(error));
+                    }
+                },
+            };
+
             if start.elapsed()?.as_millis() > timeout_ms {
                 println!("commant timeout");
                 return Ok(Command::Unknown);
             }
             sleep(POLL_INTERVAL)
         }
-        println!("command '{}' ({} bytes)", command, size);
+        let command = from_utf8(&command_buf)?;
+        println!("command '{}'", command);
 
-        if command == "GET\n" {
+        if command == "GET" {
             return Ok(Command::Get);
-        } else if command == "SET\n" {
+        } else if command == "SET" {
             return Ok(Command::Set);
         }
 
         Ok(Command::Unknown)
     }
 
-    fn handle_get(&mut self) -> Result<(), Box<dyn error::Error>> {
-        let mut key = Vec::new();
-        self.reader.read_until(0, &mut key).unwrap();
-        let key_str = from_utf8(&key[0..key.len() - 1])?;
+    fn read_varsize(&mut self) -> Result<Vec<u8>, Box<dyn error::Error>> {
+        let mut size_buf: [u8; 8] = [0; 8];
+        self.reader.read_exact(&mut size_buf)?;
 
-        println!("GET '{}'", key_str);
-        match self.storage.get(key_str.to_string()) {
+        let mut value = vec![0u8; usize::from_le_bytes(size_buf)];
+        self.reader.read_exact(&mut value)?;
+
+        return Ok(value);
+    }
+
+    fn handle_get(&mut self) -> Result<(), Box<dyn error::Error>> {
+        let key_vec = self.read_varsize()?;
+        let key = from_utf8(&key_vec)?.to_string();
+
+        println!("GET '{}'", key);
+        match self.storage.get(key) {
             Ok(val) => match val {
                 Some(value) => {
+                    let size_bytes: [u8; 8] = unsafe { transmute(value.len().to_le()) };
+                    self.writer.write_all(&size_bytes)?;
                     self.writer.write_all(&value)?;
-                    self.writer.write_all(&[0])?;
                     self.writer.flush()?;
                 }
                 None => {
-                    self.writer.write_all(&[0])?;
+                    self.writer.write_all(&[0; 8])?;
                     self.writer.flush()?;
                 }
             },
@@ -162,29 +169,15 @@ impl StreamHandler<'_> {
     }
 
     fn handle_set(&mut self) -> Result<(), Box<dyn error::Error>> {
-        let mut msg: Vec<u8> = Vec::new();
-        self.reader.read_until(0, &mut msg)?;
+        let key_vec = self.read_varsize()?;
+        let key = from_utf8(&key_vec)?.to_string();
 
-        if msg[msg.len() - 1] != 0 {
-            return Err(InvalidMsgError.into());
-        }
+        let value = self.read_varsize()?;
 
-        let mut sep_idx: usize = 0;
-        for (i, v) in msg.iter().enumerate() {
-            if *v == b'\n' {
-                sep_idx = i;
-            }
-        }
-        if sep_idx == 0 {
-            return Err(InvalidMsgError.into());
-        }
-        let key = from_utf8(&msg[0..sep_idx])?;
-        let value = &msg[sep_idx + 1..msg.len() - 1];
-
-        println!("SET '{}', '{}'", key, from_utf8(value)?);
-        match self.storage.set(key.to_string(), value, value.len()) {
+        println!("SET '{}', {} bytes", key, value.len());
+        match self.storage.set(key, &value, value.len()) {
             Ok(_) => {
-                self.writer.write_all(&[79, 75, 0])?;
+                self.writer.write_all(&OK)?;
                 self.writer.flush()?;
             }
             Err(error) => {

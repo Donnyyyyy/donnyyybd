@@ -37,6 +37,13 @@ impl LogStorage<'_> {
     }
 }
 
+fn print_vec(v: &[u8]) {
+    for i in v {
+        print!("{}", i);
+    }
+    println!();
+}
+
 impl Storage for LogStorage<'_> {
     fn get(&mut self, key: String) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
         let target_key_bytes = key.as_bytes();
@@ -52,14 +59,19 @@ impl Storage for LogStorage<'_> {
                 Err(error) => match error.kind() {
                     io::ErrorKind::UnexpectedEof => {
                         return Ok(None);
-                    },
+                    }
                     _ => {
                         return Err(Box::new(error));
-                    },
+                    }
                 },
             };
+            println!("key");
+            print_vec(&key_buf);
             self.reader.read_exact(&mut size_buf)?;
-            let value_size = usize::from_ne_bytes(size_buf);
+            println!("size_buf");
+            print_vec(&size_buf);
+            let value_size = usize::from_le_bytes(size_buf);
+            println!("value size is {} bytes", value_size);
 
             if Self::compare_keys(target_key_bytes, &key_buf) {
                 let mut value = vec![0u8; value_size];
@@ -78,6 +90,9 @@ impl Storage for LogStorage<'_> {
         size: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let key_bytes = key.as_bytes();
+
+        println!("key");
+        print_vec(key_bytes);
         self.writer.write_all(key_bytes)?;
 
         for _ in 0..KEY_SIZE - key_bytes.len() {
@@ -85,8 +100,8 @@ impl Storage for LogStorage<'_> {
         }
 
         let size_bytes: [u8; 8] = unsafe { transmute(size.to_le()) };
-        self.writer.write_all(value)?;
         self.writer.write(&size_bytes)?;
+        self.writer.write_all(value)?;
         self.writer.flush()?;
 
         Ok(())
