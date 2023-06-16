@@ -1,19 +1,23 @@
 use std::{
     error,
-    io::{self, BufReader, BufWriter, Read, Write},
+    io::{ BufReader, BufWriter, Read, Write, ErrorKind},
+    mem::transmute,
     net::{TcpListener, TcpStream},
     str::from_utf8,
-    thread::sleep,
-    time::{Duration, SystemTime}, mem::transmute,
+    sync::{Arc, Mutex},
+    thread::{self, sleep, JoinHandle},
+    time::{Duration, SystemTime},
 };
 
-use crate::storage::Storage;
+use log::{info, warn};
+
+use crate::storage::StorageClient;
+
 
 const OK: [u8; 3] = [79, 75, 0];
 
-pub struct DbServer<'a> {
+pub struct DbServer {
     listener: TcpListener,
-    storage: &'a mut dyn Storage,
 }
 
 enum Command {
@@ -22,48 +26,56 @@ enum Command {
     Unknown,
 }
 
-impl DbServer<'_> {
-    pub fn start(
-        host: String,
-        port: u16,
-        storage: &mut dyn Storage,
-    ) -> Result<DbServer, Box<dyn error::Error>> {
+impl DbServer {
+    pub fn new(host: String, port: u16) -> Result<DbServer, Box<dyn error::Error>> {
         let listener = TcpListener::bind(format!("{}:{}", host, port)).unwrap();
-        println!("Listening");
-        let mut server = DbServer {
-            listener: listener,
-            storage,
-        };
-        server.handle_incoming_connections()?;
-        Ok(server)
+        Ok(DbServer { listener: listener })
     }
 
-    fn handle_incoming_connections(&mut self) -> Result<(), Box<dyn error::Error>> {
+    pub fn start(self) -> Result<(), Box<dyn error::Error>> {
+        info!("Listening");
+        let mut threads: Vec<JoinHandle<()>> = Vec::new();
+
+        let storage_writer_mtx = Arc::new(Mutex::new(StorageClient::new_writer()?));
+
         for stream in self.listener.incoming() {
-            StreamHandler::handle(stream?, self.storage)?;
+            match stream {
+                Ok(tcp_stream) => {
+                    let writer_arc_clone = Arc::clone(&storage_writer_mtx);
+                    threads.push(thread::spawn(move || {
+                        ClientHandler::handle(&tcp_stream, StorageClient::new(writer_arc_clone).unwrap());
+                    }));
+                }
+                Err(err) => {
+                    warn!("failed to handle connection: {}", err)
+                }
+            }
         }
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
         Ok(())
     }
 }
 
-struct StreamHandler<'a> {
-    storage: &'a mut dyn Storage,
+struct ClientHandler<'a> {
+    storage: StorageClient,
     writer: BufWriter<&'a TcpStream>,
     reader: BufReader<&'a TcpStream>,
 }
 
-impl StreamHandler<'_> {
-    fn handle(stream: TcpStream, storage: &mut dyn Storage) -> Result<(), Box<dyn error::Error>> {
-        println!("new conn");
-        stream.set_read_timeout(Some(Duration::from_millis(3000)))?;
+impl ClientHandler<'_> {
+    fn handle<'a>(stream: &'a TcpStream, storage: StorageClient) {
+        info!("new conn");
 
-        StreamHandler {
+        let mut handler = ClientHandler {
             storage,
             writer: BufWriter::new(&stream),
             reader: BufReader::new(&stream),
-        }
-        .handle_loop();
-        Ok(())
+        };
+        handler.handle_loop();
     }
 
     fn handle_loop(&mut self) {
@@ -73,14 +85,14 @@ impl StreamHandler<'_> {
                     Command::Get => match self.handle_get() {
                         Ok(_) => {}
                         Err(err) => {
-                            println!("error {}", err);
+                            warn!("error {}", err);
                             break;
                         }
                     },
                     Command::Set => match self.handle_set() {
                         Ok(_) => {}
                         Err(err) => {
-                            println!("error {}", err);
+                            warn!("error {}", err);
                             break;
                         }
                     },
@@ -89,12 +101,12 @@ impl StreamHandler<'_> {
                     }
                 },
                 Err(_) => {
-                    println!("error reading command");
+                    warn!("error reading command");
                     break;
                 }
             }
         }
-        println!("client disconnected");
+        info!("client disconnected");
     }
 
     fn parse_command(&mut self) -> Result<Command, Box<dyn error::Error>> {
@@ -108,7 +120,7 @@ impl StreamHandler<'_> {
             match self.reader.read_exact(&mut command_buf) {
                 Ok(_) => break,
                 Err(error) => match error.kind() {
-                    io::ErrorKind::UnexpectedEof => {}
+                    ErrorKind::UnexpectedEof => {}
                     _ => {
                         return Err(Box::new(error));
                     }
@@ -116,13 +128,12 @@ impl StreamHandler<'_> {
             };
 
             if start.elapsed()?.as_millis() > timeout_ms {
-                println!("commant timeout");
+                info!("command timeout");
                 return Ok(Command::Unknown);
             }
             sleep(POLL_INTERVAL)
         }
         let command = from_utf8(&command_buf)?;
-        println!("command '{}'", command);
 
         if command == "GET" {
             return Ok(Command::Get);
@@ -147,7 +158,7 @@ impl StreamHandler<'_> {
         let key_vec = self.read_varsize()?;
         let key = from_utf8(&key_vec)?.to_string();
 
-        println!("GET '{}'", key);
+        info!("GET '{}'", key);
         match self.storage.get(key) {
             Ok(val) => match val {
                 Some(value) => {
@@ -174,7 +185,7 @@ impl StreamHandler<'_> {
 
         let value = self.read_varsize()?;
 
-        println!("SET '{}', {} bytes", key, value.len());
+        info!("SET '{}', {} bytes", key, value.len());
         match self.storage.set(key, &value, value.len()) {
             Ok(_) => {
                 self.writer.write_all(&OK)?;
