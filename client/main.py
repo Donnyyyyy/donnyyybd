@@ -1,4 +1,5 @@
 import asyncio
+from random import randrange
 from time import time
 
 from donnydb import DonnydbClient
@@ -7,12 +8,16 @@ from donnydb import DonnydbClient
 async def make_requests(n_req: int) -> tuple[int, int]:
     ok, err = 0, 0
 
+    n_range = (10 ** (len(str(n_req)) + 1), 10 ** (len(str(n_req)) + 2) - 1)
     async with DonnydbClient() as client:
-        for i in range(n_req):
-            key = f'key {i}'
-            value = (f'value {i}' * ((i + 1) % 100)).encode()
+        values = {}
+        for _ in range(n_req):
+            n = randrange(*n_range)
+            key = f'key {n}'
+            value = (f'value {n}' * ((n + 1) % 100)).encode()
+            values[key] = value
             try:
-                await client.set(key, value)
+                await client.set(key, values[key])
                 stored_value = await client.get(key)
                 if stored_value == value:
                     ok += 1
@@ -20,6 +25,16 @@ async def make_requests(n_req: int) -> tuple[int, int]:
                     err += 1
             except:
                 err += 1
+
+        # for key, value in values.items():
+        #     try:
+        #         stored_value = await client.get(key)
+        #         if stored_value == value:
+        #             ok += 1
+        #         else:
+        #             err += 1
+        #     except:
+        #         err += 1
 
         return ok, err
 

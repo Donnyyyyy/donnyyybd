@@ -1,10 +1,11 @@
 use std::{
+    collections::HashMap,
     error,
-    io::{ BufReader, BufWriter, Read, Write, ErrorKind},
+    io::{BufReader, BufWriter, ErrorKind, Read, SeekFrom, Write},
     mem::transmute,
     net::{TcpListener, TcpStream},
     str::from_utf8,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     thread::{self, sleep, JoinHandle},
     time::{Duration, SystemTime},
 };
@@ -12,7 +13,6 @@ use std::{
 use log::{info, warn};
 
 use crate::storage::StorageClient;
-
 
 const OK: [u8; 3] = [79, 75, 0];
 
@@ -37,13 +37,18 @@ impl DbServer {
         let mut threads: Vec<JoinHandle<()>> = Vec::new();
 
         let storage_writer_mtx = Arc::new(Mutex::new(StorageClient::new_writer()?));
+        let index_lock: Arc<RwLock<HashMap<String, SeekFrom>>> = Arc::new(RwLock::new(HashMap::new()));
 
         for stream in self.listener.incoming() {
             match stream {
                 Ok(tcp_stream) => {
                     let writer_arc_clone = Arc::clone(&storage_writer_mtx);
+                    let index_mtx_clone = Arc::clone(&index_lock);
                     threads.push(thread::spawn(move || {
-                        ClientHandler::handle(&tcp_stream, StorageClient::new(writer_arc_clone).unwrap());
+                        ClientHandler::handle(
+                            &tcp_stream,
+                            StorageClient::new(writer_arc_clone, index_mtx_clone).unwrap(),
+                        );
                     }));
                 }
                 Err(err) => {

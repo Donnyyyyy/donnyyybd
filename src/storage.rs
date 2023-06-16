@@ -1,10 +1,13 @@
 use std::{
+    collections::HashMap,
     error::Error,
     fs::{File, OpenOptions},
     io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
     mem::transmute,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
+
+use log::warn;
 
 use crate::utils::compare_keys;
 
@@ -14,6 +17,7 @@ const FILENAME: &str = "./data/data";
 pub struct StorageClient {
     reader: BufReader<File>,
     writer_mtx: Arc<Mutex<BufWriter<File>>>,
+    index_lock: Arc<RwLock<HashMap<String, SeekFrom>>>,
 }
 
 impl StorageClient {
@@ -33,17 +37,33 @@ impl StorageClient {
         Ok(BufReader::new(file))
     }
 
-    pub fn new(writer_mtx: Arc<Mutex<BufWriter<File>>>) -> Result<StorageClient, Box<dyn Error>> {
+    pub fn new(
+        writer_mtx: Arc<Mutex<BufWriter<File>>>,
+        index_lock: Arc<RwLock<HashMap<String, SeekFrom>>>,
+    ) -> Result<StorageClient, Box<dyn Error>> {
         Ok(StorageClient {
             reader: StorageClient::new_reader()?,
-            writer_mtx: writer_mtx,
+            writer_mtx,
+            index_lock,
         })
     }
 
     pub fn get(&mut self, key: String) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
         let target_key_bytes = key.as_bytes();
 
-        self.reader.seek(SeekFrom::Start(0))?;
+        {
+            let index = self.index_lock.read().unwrap();
+
+            match index.get(&key) {
+                Some(pos) => {
+                    self.reader.seek(*pos)?;
+                }
+                None => {
+                    warn!("cache miss");
+                    self.reader.seek(SeekFrom::Start(0))?;
+                }
+            }
+        }
 
         let mut key_buf = [0; KEY_SIZE];
         let mut size_buf: [u8; 8] = [0; 8];
@@ -83,6 +103,7 @@ impl StorageClient {
         let key_bytes = key.as_bytes();
         {
             let mut writer = self.writer_mtx.lock().unwrap();
+            let key_offset = writer.stream_position().unwrap();
 
             writer.write_all(key_bytes)?;
 
@@ -94,6 +115,10 @@ impl StorageClient {
             writer.write(&size_bytes)?;
             writer.write_all(value)?;
             writer.flush()?;
+            {
+                let mut index = self.index_lock.write().unwrap();
+                index.insert(String::clone(&key), SeekFrom::Start(key_offset));
+            }
         }
 
         Ok(())
